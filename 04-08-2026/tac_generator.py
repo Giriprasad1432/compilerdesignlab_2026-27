@@ -14,7 +14,7 @@ from three_address_code import TripleTAC, BinOpTriple, AssignTriple, PrintTriple
 
 class TACGenerator:
     def __init__(self):
-        self.program = TripleProgram()
+        self.program = TripleTAC()
 
     def generate(self, function):
         """
@@ -40,7 +40,16 @@ class TACGenerator:
               self.program.append(PrintTriple(operand))
 
         """
-        raise NotImplementedError("implement TACGenerator.gen_stmt()")
+        if isinstance(stmt, Assign):
+            operand = self.gen_expr(stmt.expr)
+            self.program.append(AssignTriple(stmt.var.name, operand))
+
+        if isinstance(stmt, Print):
+            operand = self.gen_expr(stmt.expr)
+            self.program.append(PrintTriple(operand))
+
+
+        #raise NotImplementedError("implement TACGenerator.gen_stmt()")
 
     def gen_expr(self, node):
         """
@@ -67,6 +76,20 @@ class TACGenerator:
         this node's own triple -- otherwise triples come out numbered in
         the wrong order and later TripleRefs point at the wrong thing.
         """
+        
+        if isinstance(node, Num):
+            return str(node.value)
+
+        if isinstance(node, Var):
+            return node.name
+
+        if isinstance(node, BinOp):
+            left = self.gen_expr(node.left)
+            right= self.gen_expr(node.right)
+            return self.program.append(BinOpTriple(node.op,left,right))
+
+
+
         raise NotImplementedError("implement TACGenerator.gen_expr()")
 
 

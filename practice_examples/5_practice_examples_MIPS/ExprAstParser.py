@@ -66,7 +66,8 @@ class ExprAstParser(Parser):
 
 lexer = ExprAstLexer()
 parser = ExprAstParser()
-inp = 'x=a*5+b*c/d'
+inp = 'x=a + b*c-a/b+c*4'
+inp=inp.replace(' ','')
 result = parser.parse(lexer.tokenize(inp))
 #print(pretty(result))
 #to_dot(result)
