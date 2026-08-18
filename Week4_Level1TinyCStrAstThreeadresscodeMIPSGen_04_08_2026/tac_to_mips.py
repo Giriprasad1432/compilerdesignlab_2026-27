@@ -206,6 +206,7 @@ class MIPSGenerator:
             self.addMIPS(f"move $a0, {reg}")
             self.addMIPS("li $v0, 1")
             self.addMIPS("syscall")
+           # self.deallocate_register(triple.arg1)
         
         #raise NotImplementedError("implement MIPSGenerator.gen_instr()")
 
