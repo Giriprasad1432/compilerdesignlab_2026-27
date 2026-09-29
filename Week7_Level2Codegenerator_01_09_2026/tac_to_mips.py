@@ -1,102 +1,140 @@
 """
 Three-Address Code (triples) to MIPS generator -- Level 2 (mixed types).
 
-Read docs/typed_3ac_reference.md and docs/mips_fp_reference.md before
-editing this file.
+Supports:
+  - INT
+  - DOUBLE
+  - CHAR
+  - STRING
+  - RelOpTriple
+  - CastTriple
+  - SelectTriple (ternary)
 
-WEEK 7: this extends Week 4's single-register-family (integer-only)
-generator to handle DOUBLE, CHAR, and STRING alongside INT, and adds
-codegen for RelOp/Cast/Ternary (via the RelOpTriple/CastTriple/
-SelectTriple triples tac_generator.py now emits).
-
-Two SEPARATE register pools now, tracked independently:
-  - Integer: $t0-$t9 (unchanged from Week 4)
-  - Floating-point: $f0, $f2, $f4, ..., $f30 -- MIPS's FPU registers are
-    used in EVEN-numbered PAIRS to hold one 8-byte double each (the odd
-    register of each pair holds the high-order half). This code always
-    allocates/frees by the even index, so you never need to think about
-    the paired odd register directly -- see docs/mips_fp_reference.md.
-
-Every triple's operand(s) get resolved to the RIGHT pool based on their
-TYPE (looked up via resolve_type() / literal_kind(), both provided) --
-an int-family value always goes through alloc_int()/the integer
-instructions; a double-family value always goes through
-alloc_float()/the ".d" instructions.
+Register pools:
+  - Integer: $t0-$t9
+  - Floating point: $f0, $f2, ..., $f30
 """
+
 from SymbolTable import DataType
 from three_address_code import (
-    BinOpTriple, RelOpTriple, CastTriple, SelectTriple, AssignTriple, PrintTriple,
-    TripleRef, is_literal,
+    BinOpTriple,
+    RelOpTriple,
+    CastTriple,
+    SelectTriple,
+    AssignTriple,
+    PrintTriple,
+    TripleRef,
 )
 
-INT_OP = {'+': 'add', '-': 'sub', '*': 'mul', '/': 'div'}
-DBL_OP = {'+': 'add.d', '-': 'sub.d', '*': 'mul.d', '/': 'div.d'}
+INT_OP = {
+    '+': 'add',
+    '-': 'sub',
+    '*': 'mul',
+    '/': 'div',
+}
 
-# int comparison -> branch-if-true pseudo-instruction (SPIM provides
-# blt/bgt/ble/bge/beq/bne as 3-operand pseudo-ops -- verified directly
-# on real SPIM, see docs/mips_fp_reference.md).
-INT_BRANCH_TRUE = {'<': 'blt', '>': 'bgt', '<=': 'ble', '>=': 'bge', '==': 'beq', '!=': 'bne'}
+DBL_OP = {
+    '+': 'add.d',
+    '-': 'sub.d',
+    '*': 'mul.d',
+    '/': 'div.d',
+}
+
+INT_BRANCH_TRUE = {
+    '<': 'blt',
+    '>': 'bgt',
+    '<=': 'ble',
+    '>=': 'bge',
+    '==': 'beq',
+    '!=': 'bne',
+}
 
 
 def literal_kind(operand):
     """
-    Provided. Returns 'int' / 'double' / 'char' / 'string' for a literal
-    operand, or None if `operand` is a variable name instead. String and
-    char literals are recognizable because tac_generator.py's Const
-    handling wraps them in their original quote characters
-    ('"hello"' / "'x'") specifically so this function can tell them
-    apart from a bare variable name by inspection -- see
-    docs/typed_3ac_reference.md.
+    Returns:
+        'int'
+        'double'
+        'char'
+        'string'
+        None
+
+    String and char literals retain their quote characters.
     """
+
     if not isinstance(operand, str):
         return None
+
     if operand.startswith('"') and operand.endswith('"'):
         return 'string'
+
     if operand.startswith("'") and operand.endswith("'"):
         return 'char'
+
     if operand.isdigit():
         return 'int'
+
     if operand.count('.') == 1:
         a, b = operand.split('.')
         if a.isdigit() and b.isdigit():
             return 'double'
+
     return None
 
 
 def triple_result_type(triple):
     """
-    Provided. Returns the DataType a given (already-generated) triple's
-    result has, for resolving a TripleRef operand's type. Only triples
-    that PRODUCE a referenceable value need a case here (AssignTriple/
-    PrintTriple never do -- nothing ever builds a TripleRef to one).
+    Returns the DataType produced by a referenceable triple.
     """
+
     if isinstance(triple, BinOpTriple):
         return triple.result_type
+
     if isinstance(triple, RelOpTriple):
-        return DataType.INT  # a comparison's own value is always INT 0/1
+        # Comparisons always produce INT 0/1.
+        return DataType.INT
+
     if isinstance(triple, CastTriple):
         return triple.target_type
+
     if isinstance(triple, SelectTriple):
         return triple.result_type
-    raise ValueError(f"triple has no referenceable result: {type(triple)}")
+
+    raise ValueError(
+        f"triple has no referenceable result: {type(triple)}"
+    )
 
 
 class MIPSGenerator:
+
     def __init__(self, symbol_table, triples):
         self.symbol_table = symbol_table
-        self.triples = triples  # needed to resolve a TripleRef operand's type
+        self.triples = triples
+
+        # Integer registers:
+        # $t0 ... $t9
         self.int_avail = [True] * 10
-        self.float_avail = [True] * 16  # represents $f0,$f2,...,$f30
+
+        # Floating point double-register pairs:
+        # $f0/$f1, $f2/$f3, ..., $f30/$f31
+        self.float_avail = [True] * 16
+
+        # Triple index -> register
         self.int_index_to_reg = {}
         self.float_index_to_reg = {}
+
         self.text_lines = []
         self.data_lines = []
+
+        # String literal -> label
         self.string_labels = {}
+
         self.label_counter = 0
 
     # ------------------------------------------------------------------
-    # Register allocation, labels, string data -- PROVIDED
+    # Register allocation
     # ------------------------------------------------------------------
+
     def alloc_int(self):
         i = self.int_avail.index(True)
         self.int_avail[i] = False
@@ -115,329 +153,1042 @@ class MIPSGenerator:
         i = int(reg[2:]) // 2
         self.float_avail[i] = True
 
+    # ------------------------------------------------------------------
+    # Labels
+    # ------------------------------------------------------------------
+
     def new_label(self):
         label = f"L{self.label_counter}"
         self.label_counter += 1
         return label
 
+    # ------------------------------------------------------------------
+    # String handling
+    # ------------------------------------------------------------------
+
     def get_string_label(self, text):
-        """Deduplicates identical string literals to one .data entry each."""
+        """
+        Deduplicates identical string literals.
+        """
+
         if text in self.string_labels:
             return self.string_labels[text]
+
         label = f"Lstr{len(self.string_labels)}"
+
         self.string_labels[text] = label
-        self.data_lines.append(f'{label}: .asciiz "{text}"')
+
+        self.data_lines.append(
+            f'{label}: .asciiz "{text}"'
+        )
+
         return label
+
+    # ------------------------------------------------------------------
+    # Emit
+    # ------------------------------------------------------------------
 
     def emit(self, line):
         self.text_lines.append(line)
+
+    # ------------------------------------------------------------------
+    # Type helpers
+    # ------------------------------------------------------------------
 
     def is_double_family(self, t):
         return t == DataType.DOUBLE
 
     def free_reg(self, reg, op_type):
-        """Frees `reg` from whichever pool matches op_type."""
+        """
+        Free a register from the appropriate register pool.
+        """
+
         if self.is_double_family(op_type):
             self.free_float(reg)
         else:
             self.free_int(reg)
 
     # ------------------------------------------------------------------
-    # Type resolution -- PROVIDED
+    # Type resolution
     # ------------------------------------------------------------------
+
     def resolve_type(self, operand):
         """
-        Returns the DataType of ANY operand (literal, variable name, or
-        TripleRef). Used by gen_print() and by load()'s callers that
-        don't already know the type from context.
+        Returns the DataType of:
+          - literal
+          - variable
+          - TripleRef
         """
+
         if isinstance(operand, TripleRef):
-            return triple_result_type(self.triples[operand.index])
+            return triple_result_type(
+                self.triples[operand.index]
+            )
+
         kind = literal_kind(operand)
+
         if kind == 'int':
             return DataType.INT
+
         if kind == 'double':
             return DataType.DOUBLE
+
         if kind == 'char':
             return DataType.CHAR
+
         if kind == 'string':
             return DataType.STRING
+
         entry = self.symbol_table.getSymbol(operand)
         return entry.getDataType()
 
     # ------------------------------------------------------------------
-    # Loading/storing operands -- TODO
+    # Loading operands
     # ------------------------------------------------------------------
+
     def load(self, operand, op_type):
         """
-        TODO(week-7): get `operand`'s value into a register of the
-        family matching op_type, and return (reg, was_fresh) --
-        was_fresh is False only for the TripleRef-reuse case (mirrors
-        Week 4's convention: a reused register must not be freed by the
-        caller, a freshly-loaded one should be).
+        Loads an operand into the appropriate register family.
 
-          isinstance(operand, TripleRef):
-              reuse self.float_index_to_reg[operand.index] if
-              is_double_family(op_type) else
-              self.int_index_to_reg[operand.index] -- return (that_reg, False)
+        Returns:
+            (register, was_fresh)
 
-          literal_kind(operand) == 'double':
-              reg = self.alloc_float(); emit `li.d reg, operand`
-
-          literal_kind(operand) == 'int':
-              reg = self.alloc_int(); emit `li reg, operand`
-
-          literal_kind(operand) == 'char':
-              reg = self.alloc_int(); emit `li reg, {ord(operand[1:-1])}`
-              -- operand is like "'x'" (with quote characters still on
-              it, see literal_kind()'s docstring), so operand[1:-1]
-              strips them before ord() converts to the character code.
-
-          literal_kind(operand) == 'string':
-              reg = self.alloc_int()
-              label = self.get_string_label(operand[1:-1])  # strip quotes
-              emit `la reg, label`  -- NOT li; `la` loads an ADDRESS
-
-          otherwise (a variable name):
-              entry = self.symbol_table.getSymbol(operand)
-              offset = entry.getOffset()
-              if is_double_family(op_type): reg = alloc_float(); emit `l.d reg, offset($fp)`
-              else: reg = alloc_int(); emit `lw reg, offset($fp)`
-
-        In every non-TripleRef case, return (reg, True).
+        was_fresh:
+            True  -> newly allocated register
+            False -> existing TripleRef register reused
         """
-        raise NotImplementedError("implement MIPSGenerator.load()")
+
+        # --------------------------------------------------------------
+        # TripleRef
+        # --------------------------------------------------------------
+
+        if isinstance(operand, TripleRef):
+
+            if self.is_double_family(op_type):
+                return (
+                    self.float_index_to_reg[operand.index],
+                    False,
+                )
+
+            return (
+                self.int_index_to_reg[operand.index],
+                False,
+            )
+
+        # --------------------------------------------------------------
+        # Literal
+        # --------------------------------------------------------------
+
+        kind = literal_kind(operand)
+
+        # DOUBLE
+        if kind == 'double':
+            reg = self.alloc_float()
+
+            self.emit(
+                f"li.d {reg}, {operand}"
+            )
+
+            return reg, True
+
+        # INT
+        if kind == 'int':
+            reg = self.alloc_int()
+
+            self.emit(
+                f"li {reg}, {operand}"
+            )
+
+            return reg, True
+
+        # CHAR
+        if kind == 'char':
+            reg = self.alloc_int()
+
+            char_value = ord(operand[1:-1])
+
+            self.emit(
+                f"li {reg}, {char_value}"
+            )
+
+            return reg, True
+
+        # STRING
+        if kind == 'string':
+            reg = self.alloc_int()
+
+            text = operand[1:-1]
+
+            label = self.get_string_label(text)
+
+            self.emit(
+                f"la {reg}, {label}"
+            )
+
+            return reg, True
+
+        # --------------------------------------------------------------
+        # Variable
+        # --------------------------------------------------------------
+
+        entry = self.symbol_table.getSymbol(operand)
+
+        offset = entry.getOffset()
+
+        if self.is_double_family(op_type):
+
+            reg = self.alloc_float()
+
+            self.emit(
+                f"l.d {reg}, {offset}($fp)"
+            )
+
+        else:
+
+            reg = self.alloc_int()
+
+            self.emit(
+                f"lw {reg}, {offset}($fp)"
+            )
+
+        return reg, True
+
+    # ------------------------------------------------------------------
+    # Store
+    # ------------------------------------------------------------------
 
     def store_to_var(self, reg, name, reg_type):
         """
-        TODO(week-7): look up name's offset via self.symbol_table, then
-        emit `s.d reg, offset($fp)` if is_double_family(reg_type), else
-        `sw reg, offset($fp)`.
+        Stores register value into a declared variable.
         """
-        raise NotImplementedError("implement MIPSGenerator.store_to_var()")
+
+        entry = self.symbol_table.getSymbol(name)
+
+        offset = entry.getOffset()
+
+        if self.is_double_family(reg_type):
+
+            self.emit(
+                f"s.d {reg}, {offset}($fp)"
+            )
+
+        else:
+
+            self.emit(
+                f"sw {reg}, {offset}($fp)"
+            )
 
     # ------------------------------------------------------------------
-    # Per-triple codegen -- TODO (this is the bulk of the week)
+    # Dispatch
     # ------------------------------------------------------------------
+
     def gen_instr(self, triple):
-        """
-        Provided -- dispatches to the right gen_* method. You should not
-        need to change this method.
-        """
+
         if isinstance(triple, BinOpTriple):
             self.gen_binop(triple)
+
         elif isinstance(triple, RelOpTriple):
             self.gen_relop(triple)
+
         elif isinstance(triple, CastTriple):
             self.gen_cast(triple)
+
         elif isinstance(triple, SelectTriple):
             self.gen_select(triple)
+
         elif isinstance(triple, AssignTriple):
             self.gen_assign(triple)
+
         elif isinstance(triple, PrintTriple):
             self.gen_print(triple)
+
         else:
-            raise ValueError(f"unexpected triple type: {type(triple)}")
+            raise ValueError(
+                f"unexpected triple type: {type(triple)}"
+            )
+
+    # ------------------------------------------------------------------
+    # Binary operation
+    # ------------------------------------------------------------------
 
     def gen_binop(self, triple):
         """
-        TODO(week-7): load both operands using triple.result_type
-        (Week 6 already ensured arg1/arg2 are the same, already-promoted
-        type as the result -- see docs/typed_3ac_reference.md). Pick
-        INT_OP or DBL_OP based on is_double_family(triple.result_type),
-        allocate a destination register from the matching pool, emit the
-        instruction, record the destination in int_index_to_reg or
-        float_index_to_reg (keyed by triple.index) accordingly, and free
-        any operand register that was freshly loaded (mirroring Week 4's
-        register-reuse-via-TripleRef convention exactly, just now across
-        two separate pools instead of one).
+        Generate:
+
+            +
+            -
+            *
+            /
+
+        for either INT-family or DOUBLE.
         """
-        raise NotImplementedError("implement MIPSGenerator.gen_binop()")
+
+        op_type = triple.result_type
+
+        # Load both operands.
+        reg1, fresh1 = self.load(
+            triple.arg1,
+            op_type
+        )
+
+        reg2, fresh2 = self.load(
+            triple.arg2,
+            op_type
+        )
+
+        # DOUBLE
+        if self.is_double_family(op_type):
+
+            dest = self.alloc_float()
+
+            instruction = DBL_OP[triple.op]
+
+            self.emit(
+                f"{instruction} {dest}, {reg1}, {reg2}"
+            )
+
+            self.float_index_to_reg[
+                triple.index
+            ] = dest
+
+        # INT / CHAR
+        else:
+
+            dest = self.alloc_int()
+
+            instruction = INT_OP[triple.op]
+
+            self.emit(
+                f"{instruction} {dest}, {reg1}, {reg2}"
+            )
+
+            self.int_index_to_reg[
+                triple.index
+            ] = dest
+
+        # Free freshly loaded operands.
+        if fresh1:
+            self.free_reg(
+                reg1,
+                op_type
+            )
+
+        if fresh2:
+            self.free_reg(
+                reg2,
+                op_type
+            )
+
+    # ------------------------------------------------------------------
+    # Relational operation
+    # ------------------------------------------------------------------
 
     def gen_relop(self, triple):
         """
-        TODO(week-7): implement using the UNIFORM branch-based pattern
-        (same shape for int and double operands, just different
-        condition-testing instructions -- see
-        docs/mips_fp_reference.md for why, and the exact instruction
-        tables to use):
+        Generate comparisons.
 
-          1. Load arg1/arg2 using triple.operand_type (NOT
-             triple's own result type -- a RelOpTriple's operands can be
-             DOUBLE while its own produced value is always INT).
-          2. Allocate an INT destination register (comparisons always
-             produce an INT 0/1, regardless of operand type).
-          3. Emit the condition test + branch:
-             - if is_double_family(triple.operand_type): use the
-               c.<cond>.d + bc1t/bc1f pattern from
-               docs/mips_fp_reference.md's comparison table (note '>' and
-               '>=' need their operands SWAPPED, and '!=' needs bc1f
-               instead of bc1t -- there's no direct "not equal" or
-               "greater than" FPU compare instruction).
-             - otherwise: emit INT_BRANCH_TRUE[triple.op] as a 3-operand
-               branch pseudo-instruction directly (no compare instruction
-               needed first -- unlike the double case).
-          4. Emit the standard "materialize 0 or 1" skeleton:
-                 li dest, 0
-                 b Lend
-                 Ltrue:
-                 li dest, 1
-                 Lend:
-             (two fresh labels from self.new_label())
-          5. Record dest in int_index_to_reg[triple.index]; free any
-             freshly-loaded operand registers.
+        INT/CHAR:
+            blt/bgt/ble/bge/beq/bne
+
+        DOUBLE:
+            c.lt.d
+            c.le.d
+            c.eq.d
+            bc1t/bc1f
         """
-        raise NotImplementedError("implement MIPSGenerator.gen_relop()")
+
+        operand_type = triple.operand_type
+
+        reg1, fresh1 = self.load(
+            triple.arg1,
+            operand_type
+        )
+
+        reg2, fresh2 = self.load(
+            triple.arg2,
+            operand_type
+        )
+
+        # Comparison result is ALWAYS INT.
+        dest = self.alloc_int()
+
+        true_label = self.new_label()
+        end_label = self.new_label()
+
+        # --------------------------------------------------------------
+        # DOUBLE comparison
+        # --------------------------------------------------------------
+
+        if self.is_double_family(operand_type):
+
+            if triple.op == '<':
+
+                self.emit(
+                    f"c.lt.d {reg1}, {reg2}"
+                )
+
+                self.emit(
+                    f"bc1t {true_label}"
+                )
+
+            elif triple.op == '<=':
+
+                self.emit(
+                    f"c.le.d {reg1}, {reg2}"
+                )
+
+                self.emit(
+                    f"bc1t {true_label}"
+                )
+
+            elif triple.op == '==':
+
+                self.emit(
+                    f"c.eq.d {reg1}, {reg2}"
+                )
+
+                self.emit(
+                    f"bc1t {true_label}"
+                )
+
+            elif triple.op == '>':
+
+                # a > b  ==  b < a
+                self.emit(
+                    f"c.lt.d {reg2}, {reg1}"
+                )
+
+                self.emit(
+                    f"bc1t {true_label}"
+                )
+
+            elif triple.op == '>=':
+
+                # a >= b  ==  b <= a
+                self.emit(
+                    f"c.le.d {reg2}, {reg1}"
+                )
+
+                self.emit(
+                    f"bc1t {true_label}"
+                )
+
+            elif triple.op == '!=':
+
+                # Equal flag false means not equal.
+                self.emit(
+                    f"c.eq.d {reg1}, {reg2}"
+                )
+
+                self.emit(
+                    f"bc1f {true_label}"
+                )
+
+            else:
+                raise ValueError(
+                    f"unexpected relational operator: "
+                    f"{triple.op}"
+                )
+
+        # --------------------------------------------------------------
+        # INT / CHAR comparison
+        # --------------------------------------------------------------
+
+        else:
+
+            branch = INT_BRANCH_TRUE[
+                triple.op
+            ]
+
+            self.emit(
+                f"{branch} {reg1}, {reg2}, {true_label}"
+            )
+
+        # --------------------------------------------------------------
+        # False result
+        # --------------------------------------------------------------
+
+        self.emit(
+            f"li {dest}, 0"
+        )
+
+        self.emit(
+            f"b {end_label}"
+        )
+
+        # --------------------------------------------------------------
+        # True result
+        # --------------------------------------------------------------
+
+        self.emit(
+            f"{true_label}:"
+        )
+
+        self.emit(
+            f"li {dest}, 1"
+        )
+
+        self.emit(
+            f"{end_label}:"
+        )
+
+        # Comparison produces INT.
+        self.int_index_to_reg[
+            triple.index
+        ] = dest
+
+        # Free freshly loaded operands.
+        if fresh1:
+            self.free_reg(
+                reg1,
+                operand_type
+            )
+
+        if fresh2:
+            self.free_reg(
+                reg2,
+                operand_type
+            )
+
+    # ------------------------------------------------------------------
+    # Cast
+    # ------------------------------------------------------------------
 
     def gen_cast(self, triple):
         """
-        TODO(week-7): load triple.arg using triple.source_type. Three
-        cases, based on triple.source_type/triple.target_type:
+        Generate:
 
-          source DOUBLE, target INT (or CHAR):
-              tmp = self.alloc_float()
-              emit `cvt.w.d tmp, src`
-              dest = self.alloc_int()
-              emit `mfc1 dest, tmp`
-              self.free_float(tmp)
-              record dest in int_index_to_reg[triple.index]
-
-          source INT (or CHAR), target DOUBLE:
-              tmp = self.alloc_float()
-              emit `mtc1 src, tmp`
-              dest = self.alloc_float()
-              emit `cvt.d.w dest, tmp`
-              self.free_float(tmp)
-              record dest in float_index_to_reg[triple.index]
-
-          same family both sides (e.g. CHAR<->INT): no conversion
-          instruction needed at all -- the loaded register IS already
-          the right bit pattern. Just record src directly as this
-          triple's result (in whichever dict matches target_type) and
-          do NOT free it, even if it was freshly loaded -- it's still in
-          use as the cast's own result now.
-
-        Free the ORIGINAL loaded src register only in the two
-        conversion cases above, and only if it was freshly loaded (not a
-        reused TripleRef).
+            DOUBLE -> INT/CHAR
+            INT/CHAR -> DOUBLE
+            same-family cast
         """
-        raise NotImplementedError("implement MIPSGenerator.gen_cast()")
+
+        src, fresh = self.load(
+            triple.arg,
+            triple.source_type
+        )
+
+        source_double = self.is_double_family(
+            triple.source_type
+        )
+
+        target_double = self.is_double_family(
+            triple.target_type
+        )
+
+        # --------------------------------------------------------------
+        # DOUBLE -> INT/CHAR
+        # --------------------------------------------------------------
+
+        if source_double and not target_double:
+
+            # Scratch FPU register.
+            tmp = self.alloc_float()
+
+            self.emit(
+                f"cvt.w.d {tmp}, {src}"
+            )
+
+            # Move converted integer out of FPU.
+            dest = self.alloc_int()
+
+            self.emit(
+                f"mfc1 {dest}, {tmp}"
+            )
+
+            self.free_float(tmp)
+
+            self.int_index_to_reg[
+                triple.index
+            ] = dest
+
+            if fresh:
+                self.free_float(src)
+
+        # --------------------------------------------------------------
+        # INT/CHAR -> DOUBLE
+        # --------------------------------------------------------------
+
+        elif not source_double and target_double:
+
+            # Scratch FPU register.
+            tmp = self.alloc_float()
+
+            self.emit(
+                f"mtc1 {src}, {tmp}"
+            )
+
+            dest = self.alloc_float()
+
+            self.emit(
+                f"cvt.d.w {dest}, {tmp}"
+            )
+
+            self.free_float(tmp)
+
+            self.float_index_to_reg[
+                triple.index
+            ] = dest
+
+            if fresh:
+                self.free_int(src)
+
+        # --------------------------------------------------------------
+        # Same register family
+        # --------------------------------------------------------------
+
+        else:
+
+            # CHAR <-> INT requires no actual instruction.
+            #
+            # The existing register contains the correct bit pattern,
+            # so this triple simply aliases it.
+            if target_double:
+
+                self.float_index_to_reg[
+                    triple.index
+                ] = src
+
+            else:
+
+                self.int_index_to_reg[
+                    triple.index
+                ] = src
+
+            # DO NOT FREE src.
+            #
+            # It is now the result of this triple.
+
+    # ------------------------------------------------------------------
+    # Ternary / Select
+    # ------------------------------------------------------------------
 
     def gen_select(self, triple):
         """
-        TODO(week-7): the ternary operator, entirely branch-based (this
-        is the specific instruction from this week's lab plan). The
-        tricky part: BOTH branches must end up writing their value into
-        the SAME destination register, since there's no way to know
-        which branch ran by the time execution reaches the code after
-        the ternary. See docs/mips_fp_reference.md for a fully worked
-        trace of this exact pattern.
+        Generate:
 
-        Order matters -- allocate dest FIRST, before evaluating either
-        branch, so the allocator can't hand out dest's register to
-        anything used while computing the branches:
+            cond ? then_val : else_val
 
-          1. dest = alloc_float() or alloc_int(), based on
-             is_double_family(triple.result_type).
-          2. Load triple.cond using triple.cond_type. Test its
-             truthiness and branch to a "then" label if true:
-             - double cond: compare against a zero register via c.eq.d,
-               branch on bc1f (branch when NOT equal to zero, i.e. when
-               truthy) -- see docs/mips_fp_reference.md.
-             - int/char cond: `bne cond_reg, $zero, Lthen`
-             Free cond_reg if it was freshly loaded.
-          3. ELSE branch: load triple.else_val using triple.result_type,
-             move it into dest (`mov.d dest, reg` or `move dest, reg`
-             depending on family), free the loaded register if fresh,
-             then unconditionally branch to an "end" label.
-          4. THEN label, then: load triple.then_val using
-             triple.result_type, move it into dest the same way, free if
-             fresh.
-          5. END label.
-          6. Record dest in int_index_to_reg[triple.index] or
-             float_index_to_reg[triple.index], matching triple.result_type.
+        using branches.
+
+        Destination is allocated BEFORE loading the condition or either
+        branch operand.
         """
-        raise NotImplementedError("implement MIPSGenerator.gen_select()")
+
+        result_type = triple.result_type
+
+        is_double = self.is_double_family(
+            result_type
+        )
+
+        # --------------------------------------------------------------
+        # Allocate destination FIRST.
+        # --------------------------------------------------------------
+
+        if is_double:
+            dest = self.alloc_float()
+        else:
+            dest = self.alloc_int()
+
+        # --------------------------------------------------------------
+        # Condition
+        # --------------------------------------------------------------
+
+        cond, fresh_cond = self.load(
+            triple.cond,
+            triple.cond_type
+        )
+
+        then_label = self.new_label()
+        end_label = self.new_label()
+
+        # --------------------------------------------------------------
+        # Test condition
+        # --------------------------------------------------------------
+
+        if self.is_double_family(
+            triple.cond_type
+        ):
+
+            # A double is truthy when it is nonzero.
+            #
+            # Compare cond == 0.
+            # If comparison is FALSE, cond != 0,
+            # therefore branch to THEN.
+
+            zero = self.alloc_float()
+
+            self.emit(
+                f"li.d {zero}, 0.0"
+            )
+
+            self.emit(
+                f"c.eq.d {cond}, {zero}"
+            )
+
+            self.emit(
+                f"bc1f {then_label}"
+            )
+
+            self.free_float(zero)
+
+        else:
+
+            # INT/CHAR truthiness:
+            # nonzero means true.
+            self.emit(
+                f"bne {cond}, $zero, {then_label}"
+            )
+
+        # Condition is no longer needed after the branch.
+        if fresh_cond:
+            self.free_reg(
+                cond,
+                triple.cond_type
+            )
+
+        # --------------------------------------------------------------
+        # ELSE branch
+        # --------------------------------------------------------------
+
+        else_reg, fresh_else = self.load(
+            triple.else_val,
+            result_type
+        )
+
+        if is_double:
+
+            self.emit(
+                f"mov.d {dest}, {else_reg}"
+            )
+
+        else:
+
+            self.emit(
+                f"move {dest}, {else_reg}"
+            )
+
+        if fresh_else:
+            self.free_reg(
+                else_reg,
+                result_type
+            )
+
+        # Skip THEN branch.
+        self.emit(
+            f"b {end_label}"
+        )
+
+        # --------------------------------------------------------------
+        # THEN branch
+        # --------------------------------------------------------------
+
+        self.emit(
+            f"{then_label}:"
+        )
+
+        then_reg, fresh_then = self.load(
+            triple.then_val,
+            result_type
+        )
+
+        if is_double:
+
+            self.emit(
+                f"mov.d {dest}, {then_reg}"
+            )
+
+        else:
+
+            self.emit(
+                f"move {dest}, {then_reg}"
+            )
+
+        if fresh_then:
+            self.free_reg(
+                then_reg,
+                result_type
+            )
+
+        # --------------------------------------------------------------
+        # End
+        # --------------------------------------------------------------
+
+        self.emit(
+            f"{end_label}:"
+        )
+
+        # Store destination as this triple's result.
+        if is_double:
+
+            self.float_index_to_reg[
+                triple.index
+            ] = dest
+
+        else:
+
+            self.int_index_to_reg[
+                triple.index
+            ] = dest
+
+    # ------------------------------------------------------------------
+    # Assignment
+    # ------------------------------------------------------------------
 
     def gen_assign(self, triple):
         """
-        TODO(week-7): look up triple.dest's declared type via
-        self.symbol_table.getSymbol(triple.dest).getDataType(), load()
-        triple.arg1 using that type, store_to_var() the result, then
-        free the register (mirroring Week 4's "store always frees its
-        register" convention -- true regardless of which pool the
-        register came from).
+        Assignment:
+
+            variable = expression
         """
-        raise NotImplementedError("implement MIPSGenerator.gen_assign()")
+
+        dest_type = (
+            self.symbol_table
+            .getSymbol(triple.dest)
+            .getDataType()
+        )
+
+        reg, fresh = self.load(
+            triple.arg1,
+            dest_type
+        )
+
+        self.store_to_var(
+            reg,
+            triple.dest,
+            dest_type
+        )
+
+        # Only a freshly-loaded register belongs to this assignment.
+        #
+        # A reused TripleRef register remains allocated because a later
+        # triple may still reference its producing triple.
+        if fresh:
+            self.free_reg(
+                reg,
+                dest_type
+            )
+
+    # ------------------------------------------------------------------
+    # Print
+    # ------------------------------------------------------------------
 
     def gen_print(self, triple):
         """
-        TODO(week-7): resolve_type(triple.arg1) to find what's being
-        printed, load() it, then pick the syscall by type:
-
-          DataType.DOUBLE: `mov.d $f12, reg` / `li $v0, 3` / `syscall`
-          DataType.STRING: `move $a0, reg` / `li $v0, 4` / `syscall`
-          DataType.CHAR:   `move $a0, reg` / `li $v0, 11` / `syscall`
-                           (print-character syscall -- not in the
-                           lab plan's own list, added here so `print c;`
-                           for a char variable shows the actual
-                           character rather than its ordinal number;
-                           see docs/mips_fp_reference.md)
-          otherwise (INT): `move $a0, reg` / `li $v0, 1` / `syscall`
-                           (unchanged from Week 4)
-
-        Free the register afterward if it was freshly loaded.
+        Print:
+            INT    -> syscall 1
+            DOUBLE -> syscall 3
+            STRING -> syscall 4
+            CHAR   -> syscall 11
         """
-        raise NotImplementedError("implement MIPSGenerator.gen_print()")
+
+        value_type = self.resolve_type(
+            triple.arg1
+        )
+
+        reg, fresh = self.load(
+            triple.arg1,
+            value_type
+        )
+
+        # --------------------------------------------------------------
+        # DOUBLE
+        # --------------------------------------------------------------
+
+        if value_type == DataType.DOUBLE:
+
+            self.emit(
+                f"mov.d $f12, {reg}"
+            )
+
+            self.emit(
+                "li $v0, 3"
+            )
+
+            self.emit(
+                "syscall"
+            )
+
+        # --------------------------------------------------------------
+        # STRING
+        # --------------------------------------------------------------
+
+        elif value_type == DataType.STRING:
+
+            self.emit(
+                f"move $a0, {reg}"
+            )
+
+            self.emit(
+                "li $v0, 4"
+            )
+
+            self.emit(
+                "syscall"
+            )
+
+        # --------------------------------------------------------------
+        # CHAR
+        # --------------------------------------------------------------
+
+        elif value_type == DataType.CHAR:
+
+            self.emit(
+                f"move $a0, {reg}"
+            )
+
+            self.emit(
+                "li $v0, 11"
+            )
+
+            self.emit(
+                "syscall"
+            )
+
+        # --------------------------------------------------------------
+        # INT
+        # --------------------------------------------------------------
+
+        else:
+
+            self.emit(
+                f"move $a0, {reg}"
+            )
+
+            self.emit(
+                "li $v0, 1"
+            )
+
+            self.emit(
+                "syscall"
+            )
+
+        if fresh:
+            self.free_reg(
+                reg,
+                value_type
+            )
 
     # ------------------------------------------------------------------
-    # Prologue / epilogue -- PROVIDED, unchanged from Week 4
+    # Prologue
     # ------------------------------------------------------------------
+
     def emit_prologue(self, frame_size):
-        self.emit("subu $sp, $sp, 4")
-        self.emit("sw   $ra, 0($sp)")
-        self.emit("subu $sp, $sp, 4")
-        self.emit("sw   $fp, 0($sp)")
-        self.emit(f"addiu $fp, $sp, -{frame_size}")
-        self.emit("move $sp, $fp")
+
+        self.emit(
+            "subu $sp, $sp, 4"
+        )
+
+        self.emit(
+            "sw   $ra, 0($sp)"
+        )
+
+        self.emit(
+            "subu $sp, $sp, 4"
+        )
+
+        self.emit(
+            "sw   $fp, 0($sp)"
+        )
+
+        self.emit(
+            f"addiu $fp, $sp, -{frame_size}"
+        )
+
+        self.emit(
+            "move $sp, $fp"
+        )
+
+    # ------------------------------------------------------------------
+    # Epilogue
+    # ------------------------------------------------------------------
 
     def emit_epilogue(self, frame_size):
-        self.emit(f"addiu $sp, $fp, {frame_size}")
-        self.emit("lw    $fp, 0($sp)")
-        self.emit("addiu $sp, $sp, 4")
-        self.emit("lw    $ra, 0($sp)")
-        self.emit("addiu $sp, $sp, 4")
-        self.emit("jr    $ra")
+
+        self.emit(
+            f"addiu $sp, $fp, {frame_size}"
+        )
+
+        self.emit(
+            "lw    $fp, 0($sp)"
+        )
+
+        self.emit(
+            "addiu $sp, $sp, 4"
+        )
+
+        self.emit(
+            "lw    $ra, 0($sp)"
+        )
+
+        self.emit(
+            "addiu $sp, $sp, 4"
+        )
+
+        self.emit(
+            "jr    $ra"
+        )
+
+    # ------------------------------------------------------------------
+    # Generate complete program
+    # ------------------------------------------------------------------
 
     def generate(self, triples, frame_size):
-        """
-        Provided. Emits the prologue, the body (one gen_instr() call per
-        triple, in order), then the epilogue, and renders the final .s
-        text. You should not need to change this method.
-        """
+
         self.emit_prologue(frame_size)
+
         for triple in triples:
             self.gen_instr(triple)
+
         self.emit_epilogue(frame_size)
+
         return self.render()
 
+    # ------------------------------------------------------------------
+    # Render
+    # ------------------------------------------------------------------
+
     def render(self):
-        """Provided. Assembles .data (only if string literals were used) + .text."""
+
         lines = []
+
+        # .data is only emitted if strings were encountered.
         if self.data_lines:
+
             lines.append(".data")
             lines.extend(self.data_lines)
+
         lines.append(".text")
         lines.append(".globl main")
         lines.append("main:")
-        lines.extend(f"    {line}" for line in self.text_lines)
+
+        lines.extend(
+            f"    {line}"
+            for line in self.text_lines
+        )
+
         return "\n".join(lines) + "\n"
 
 
+# ======================================================================
+# Convenience wrapper
+# ======================================================================
+
 def generate_mips(function, triple_program):
     """
-    Convenience wrapper. Assumes assignOffsetsToSymbols() has already
-    been called on function.getLocalSymbolTable() -- see Function.compile().
+    Convenience wrapper.
+
+    Assumes assignOffsetsToSymbols() has already been called on
+    function.getLocalSymbolTable().
     """
-    gen = MIPSGenerator(function.getLocalSymbolTable(), triple_program.triples)
-    return gen.generate(triple_program, function.getLocalSymbolTable().size())
+
+    gen = MIPSGenerator(
+        function.getLocalSymbolTable(),
+        triple_program.triples
+    )
+
+    return gen.generate(
+        triple_program,
+        function.getLocalSymbolTable().size()
+    )
+
