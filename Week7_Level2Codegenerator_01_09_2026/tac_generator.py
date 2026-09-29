@@ -135,7 +135,7 @@ class TACGenerator:
         cond= self.gen_expr(node.cond)
         then_val = self.gen_expr(node.then_expr)
         else_val = self.gen_expr(node.else_expr)
-        return self.program.append(SelectTriple(cond, node.cond.result_type. then_val. else_val, node.result_type))
+        return self.program.append(SelectTriple(cond, node.cond.result_type, then_val, else_val, node.result_type))
 
         raise NotImplementedError("implement TACGenerator.gen_ternary()")
 

@@ -1,0 +1,4 @@
+Function main
+  Assign
+    Var(b)
+    Var(a)
